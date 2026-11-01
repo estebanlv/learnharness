@@ -100,4 +100,17 @@ describe("warm-token cache (mitigation D, owner 2026-09-27)", () => {
 		await new Promise((r) => setTimeout(r, 0)); // let the background mint settle
 		assert.equal(mints, 1);
 	});
+	it("an older failed prewarm cannot invalidate the refreshed token", async () => {
+		let rejectOld!: (error: Error) => void;
+		let mints = 0;
+		const m = createWarmMinter(() => ++mints === 1
+			? new Promise<string>((_, reject) => { rejectOld = reject; })
+			: Promise.resolve("refreshed"));
+		const old = m.mint();
+		m.refresh();
+		rejectOld(new Error("old request failed"));
+		await assert.rejects(old);
+		assert.equal(await m.mint(), "refreshed");
+		assert.equal(mints, 2);
+	});
 });

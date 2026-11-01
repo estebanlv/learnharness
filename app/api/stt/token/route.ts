@@ -29,20 +29,26 @@ export async function GET() {
 			method: "POST",
 			headers: { Authorization: `Token ${key}`, "Content-Type": "application/json" },
 			body: JSON.stringify({ ttl_seconds: 300 }),
+			signal: AbortSignal.timeout(5000),
 		});
 		if (!res.ok) {
-			const detail = await res.text();
+			await res.body?.cancel();
+			console.warn("[dictation] Deepgram token grant rejected", { status: res.status });
 			return Response.json(
-				{ message: `Deepgram token grant failed (${res.status}): ${detail.slice(0, 200)}` },
+				{ message: `Deepgram token grant failed (${res.status})`, retryable: res.status === 408 || res.status === 429 || res.status >= 500 },
 				{ status: 502 },
 			);
 		}
 		const data = (await res.json()) as { access_token?: string };
 		if (!data.access_token) {
-			return Response.json({ message: "Deepgram grant returned no token" }, { status: 502 });
+			return Response.json({ message: "Deepgram grant returned no token", retryable: true }, { status: 502 });
 		}
 		return Response.json({ token: data.access_token });
-	} catch {
-		return Response.json({ message: "Deepgram unreachable" }, { status: 502 });
+	} catch (error) {
+		// Error messages and request objects may contain credentials. Record only
+		// the exception type and network code (e.g. ETIMEDOUT / ECONNRESET).
+		const failure = error as { name?: string; cause?: { code?: string } } | null;
+		console.warn("[dictation] Deepgram token request failed", { name: failure?.name, code: failure?.cause?.code });
+		return Response.json({ message: "Deepgram unreachable", retryable: true }, { status: 502 });
 	}
 }

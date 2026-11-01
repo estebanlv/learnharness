@@ -75,8 +75,9 @@ import { Hint } from "@/components/ui/hint";
  *     worklet-module fetch on every start (through the dev server in dev).
  *   - WARM TOKEN (D): pre-minted at page mount and refreshed after every
  *     run (TTL 3min); the click no longer waits on the remote mint. A
- *     stale-token handshake failure self-heals via the reconnect-once
- *     path, which always mints FRESH.
+ *     stale-token handshake failure self-heals via the recovery
+ *     path, which always mints FRESH. Recovery now retries for up to 20s
+ *     per interruption, with capture still running into the 32s queue.
  *   - The honest floor stays: getUserMedia can't be pre-warmed (the mic
  *     indicator would stay lit) — hence the owner's optimistic meter.
  */
@@ -120,12 +121,19 @@ export const DICTATION_KEYLESS = "Dictation needs a Deepgram key";
  *  DEEPGRAM_API_KEY) is the route's ONLY 503 — the raw message is
  *  dev-speak, so the error becomes the short client-authored line
  *  (zero-keys wave, owner 2026-09-25). */
+class DictationTokenError extends Error {
+	constructor(message: string, readonly retryable: boolean) {
+		super(message);
+	}
+}
+
 async function mintFreshToken(): Promise<string> {
-	const res = await fetch("/api/stt/token");
-	const data = (await res.json()) as { token?: string; message?: string };
+	const res = await fetch("/api/stt/token", { signal: AbortSignal.timeout(5000), cache: "no-store" });
+	const data = (await res.json()) as { token?: string; message?: string; retryable?: boolean };
 	if (!res.ok || !data.token) {
-		if (res.status === 503) throw new Error(DICTATION_KEYLESS);
-		throw new Error(data.message ?? `token route ${res.status}`);
+		if (res.status === 503 && data.retryable !== true) throw new DictationTokenError(DICTATION_KEYLESS, false);
+		throw new DictationTokenError(data.message ?? `token route ${res.status}`,
+			data.retryable ?? (res.status === 429 || res.status >= 500));
 	}
 	return data.token;
 }
@@ -133,7 +141,7 @@ async function mintFreshToken(): Promise<string> {
 /** Warm-token cache (mitigation D, owner 2026-09-27): the click path takes
  *  the cached promise instead of a remote mint. TTL keeps a cached token
  *  from going stale (self-heal anyway: a rejected handshake rides the
- *  reconnect-once path with a FRESH mint); a failed mint resets the cache
+ *  recovery path with a FRESH mint); a failed mint resets the cache
  *  so the next call re-mints — the honest error path stays honest.
  *  refresh() re-mints in the background (page mount, run end); its
  *  failures are silently tolerated (a keyless pre-mint just doesn't warm). */
@@ -151,7 +159,7 @@ export function createWarmMinter(
 		mint: () => {
 			if (!warm || now() - warm.at > ttlMs) {
 				const p = mint().catch((e: unknown) => {
-					warm = null; // failed mint: next call re-mints
+					if (warm?.p === p) warm = null; // only invalidate this mint
 					throw e;
 				});
 				warm = { p, at: now() };
@@ -167,6 +175,183 @@ export function createWarmMinter(
 }
 
 const warmTokens = createWarmMinter(mintFreshToken);
+
+export const DICTATION_RECOVERY_MS = 20_000;
+export const DICTATION_KEEPALIVE_MS = 3000;
+
+/** Transport recovery owns its timers and socket identity. Capture continues
+ * independently while a connection is replaced; only an explicit stop or an
+ * exhausted recovery window ends the run. No credentials enter diagnostics. */
+export function createDictationConnection(options: {
+	initialToken: Promise<string>;
+	mintToken: () => Promise<string>;
+	onRecording: () => void;
+	onTranscript: (text: string) => void;
+	onError: (message: string) => void;
+	onEnd: () => void;
+}) {
+	let socket: WebSocket | null = null;
+	let ended = false;
+	let stopping = false;
+	let started = false;
+	let attempt = 0;
+	let retries = 0;
+	let firstToken = true;
+	// 256 PCM frames at 128ms each cover the entire 20s recovery window.
+	const pending: ArrayBuffer[] = [];
+	let deadline: ReturnType<typeof setTimeout> | undefined;
+	let retry: ReturnType<typeof setTimeout> | undefined;
+	let handshake: ReturnType<typeof setTimeout> | undefined;
+	let keepalive: ReturnType<typeof setInterval> | undefined;
+	let stopTimer: ReturnType<typeof setTimeout> | undefined;
+	let lastError = "Deepgram connection lost";
+
+	function retireSocket() {
+		clearTimeout(handshake);
+		clearInterval(keepalive);
+		const previous = socket;
+		socket = null; // close/error events from this socket are now stale
+		if (previous && previous.readyState < WebSocket.CLOSING) {
+			try { previous.close(); } catch { /* Already unusable; its callbacks are stale. */ }
+		}
+	}
+	function dispose() {
+		ended = true;
+		attempt++;
+		clearTimeout(deadline);
+		clearTimeout(retry);
+		clearTimeout(stopTimer);
+		retireSocket();
+		pending.length = 0;
+	}
+	function end(message?: string) {
+		if (ended) return;
+		dispose();
+		if (message) options.onError(message);
+		options.onEnd();
+	}
+	function recover() {
+		if (ended || stopping) return;
+		if (deadline === undefined) {
+			deadline = setTimeout(() => end(lastError), DICTATION_RECOVERY_MS);
+		}
+	}
+	function retryConnection() {
+		if (ended || stopping) return;
+		attempt++;
+		retireSocket();
+		recover();
+		clearTimeout(retry);
+		retry = setTimeout(() => void connect(), Math.min(250 * 2 ** retries++, 2000));
+	}
+	async function connect() {
+		if (ended || stopping) return;
+		const currentAttempt = ++attempt;
+		let token: string;
+		try {
+			const tokenPromise = firstToken ? options.initialToken : options.mintToken();
+			firstToken = false;
+			token = await tokenPromise;
+		} catch (error) {
+			if (ended || stopping || attempt !== currentAttempt) return;
+			lastError = error instanceof Error ? error.message : "Deepgram token unavailable";
+			if (error instanceof DictationTokenError && !error.retryable) end(lastError);
+			else retryConnection();
+			return;
+		}
+		if (ended || stopping || attempt !== currentAttempt) return;
+		let ws: WebSocket;
+		try {
+			ws = new WebSocket(DG_URL, ["bearer", token]);
+		} catch {
+			lastError = "Deepgram connection failed";
+			retryConnection();
+			return;
+		}
+		socket = ws;
+		const current = () => !ended && socket === ws;
+		handshake = setTimeout(() => {
+			if (!current() || stopping) return;
+			lastError = "Deepgram connection timed out";
+			retryConnection();
+		}, 5000);
+		ws.addEventListener("open", () => {
+			if (!current() || stopping) return;
+			clearTimeout(handshake);
+			try {
+				while (pending.length) {
+					ws.send(pending[0]!);
+					pending.shift();
+				}
+			} catch {
+				retryConnection();
+				return;
+			}
+			clearTimeout(deadline);
+			deadline = undefined;
+			retries = 0;
+			keepalive = setInterval(() => {
+				if (!current() || stopping || ws.readyState !== WebSocket.OPEN) return;
+				try { ws.send(JSON.stringify({ type: "KeepAlive" })); }
+				catch { retryConnection(); }
+			}, DICTATION_KEEPALIVE_MS);
+			options.onRecording();
+		});
+		ws.addEventListener("message", (event) => {
+			if (!current()) return;
+			try {
+				const message = JSON.parse(event.data as string);
+				const text = message.channel?.alternatives?.[0]?.transcript;
+				if (message.type === "Results" && message.is_final && typeof text === "string" && text) {
+					options.onTranscript(text);
+				}
+			} catch { /* Ignore non-JSON frames. */ }
+		});
+		ws.addEventListener("error", () => {
+			if (current()) console.warn("[dictation] WebSocket error; awaiting close");
+		});
+		ws.addEventListener("close", (event) => {
+			if (!current()) return;
+			if (stopping) { end(); return; }
+			// A normal server close is not evidence that the learner pressed Stop.
+			console.warn("[dictation] Unexpected WebSocket close", { code: event.code });
+			lastError = `Deepgram connection lost (${event.code})`;
+			if (event.code === 1008 || event.code === 1003) end(lastError);
+			else retryConnection();
+		});
+	}
+	return {
+		start() {
+			if (started || ended) return;
+			started = true;
+			recover();
+			void connect();
+		},
+		sendAudio(frame: ArrayBuffer) {
+			if (ended || stopping || frame.byteLength === 0) return;
+			if (socket?.readyState === WebSocket.OPEN) {
+				try { socket.send(frame); return; }
+				catch { retryConnection(); }
+			}
+			pending.push(frame);
+			if (pending.length > 256) pending.shift();
+		},
+		stop() {
+			if (ended || stopping) return;
+			stopping = true;
+			attempt++;
+			clearTimeout(deadline);
+			clearTimeout(retry);
+			clearTimeout(handshake);
+			clearInterval(keepalive);
+			if (socket?.readyState !== WebSocket.OPEN) { end(); return; }
+			stopTimer = setTimeout(() => end(), 3000);
+			try { socket.send(JSON.stringify({ type: "CloseStream" })); }
+			catch { end(); }
+		},
+		dispose,
+	};
+}
 
 /* Persistent capture graph (mitigation C, owner 2026-09-27): one
  * app-lifetime AudioContext + a module-load memo. Created under the
@@ -297,18 +482,12 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 	// Live machinery (non-render values). The MediaStream tracks stop and
 	// the per-run nodes disconnect on teardown; the socket is recreated per
 	// run; the AudioContext is app-lifetime (mitigation C).
-	const wsRef = useRef<WebSocket | null>(null);
+	const connectionRef = useRef<ReturnType<typeof createDictationConnection> | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	/** Per-run graph nodes — the CONTEXT outlives runs (mitigation C). */
 	const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
 	const workletRef = useRef<AudioWorkletNode | null>(null);
-	/** Frames captured before the socket is OPEN (mitigation A): flushed in
-	 *  order on open; capped at 256 frames (≈32s) with the oldest dropped;
-	 *  cleared at teardown so a dead run's audio can't leak into the next. */
-	const pendingRef = useRef<ArrayBuffer[]>([]);
-	const genRef = useRef(0); // stale-handler guard (dictate pattern)
-	const safetyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const reconnectsRef = useRef(0);
+	const genRef = useRef(0); // stale-handler guard
 	/** The deferred transcript (owner round 2): finals land here during the
 	 *  run and flush into the primary input once, at teardown. */
 	const bufferRef = useRef<string[]>([]);
@@ -331,11 +510,9 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		genRef.current++;
 		dictationActiveFlag = false;
 		flush(); // the deferred transcript appears when the run ends (owner round 2)
-		if (safetyRef.current) {
-			clearTimeout(safetyRef.current);
-			safetyRef.current = null;
-		}
-		pendingRef.current = [];
+		const connection = connectionRef.current;
+		connectionRef.current = null;
+		connection?.dispose();
 		for (const track of streamRef.current?.getTracks() ?? []) track.stop();
 		streamRef.current = null;
 		sourceRef.current?.disconnect();
@@ -343,13 +520,6 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		workletRef.current?.disconnect();
 		workletRef.current = null;
 		// The AudioContext is app-lifetime (mitigation C) — nodes die, it stays.
-		const ws = wsRef.current;
-		wsRef.current = null;
-		if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-			try {
-				ws.close();
-			} catch {}
-		}
 		setPhase("idle");
 		// The finish() waiters ride until NOW — post-flush, post-teardown:
 		// a submit path resuming after `await finishDictation()` reads the
@@ -360,78 +530,11 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		warmTokens.refresh();
 	}, []);
 
-	/** Open the Deepgram socket and wire its messages. `gen` guards staleness. */
-	const openSocket = useCallback(
-		(gen: number, token: string) => {
-			// Minted JWTs authenticate via the "bearer" subprotocol — ["token",
-			// jwt] is rejected at the handshake (verified live; "token" is for
-			// raw API keys only, as in the owner's pi dictate extension).
-			const ws = new WebSocket(DG_URL, ["bearer", token]);
-			wsRef.current = ws;
-
-			ws.addEventListener("open", () => {
-				if (gen !== genRef.current) return;
-				// Mitigation A: everything captured during the handshake (or a
-				// reconnect gap) goes out now, in order — Deepgram accepts
-				// faster-than-realtime sends.
-				for (const frame of pendingRef.current) ws.send(frame);
-				pendingRef.current = [];
-				setPhase("recording");
-			});
-			ws.addEventListener("message", (ev) => {
-				if (gen !== genRef.current) return;
-				let msg: any;
-				try {
-					msg = JSON.parse(ev.data as string);
-				} catch {
-					return;
-				}
-				if (msg.type === "Results") {
-					const text: string | undefined = msg.channel?.alternatives?.[0]?.transcript;
-					// Only finals stream (interim_results=false). DEFERRED (owner
-					// round 2): they buffer here and reach the input once, at
-					// teardown — the meter is the only live feedback.
-					if (msg.is_final && text) bufferRef.current.push(text);
-				}
-			});
-			ws.addEventListener("close", (ev) => {
-				if (gen !== genRef.current) return;
-				if (ev.code === 1000) {
-					// Our own CloseStream landing: finalize now — the stop path's
-					// safety net stays as the no-close backstop only.
-					cleanup();
-					return;
-				}
-				// Abnormal close mid-run: ONE reconnect with a fresh token (the
-				// research pass: resume is our job, no SDK to lean on).
-				if (reconnectsRef.current < 1) {
-					reconnectsRef.current++;
-					mintFreshToken() // always FRESH — a stale warm token is the likely culprit
-						.then((t) => {
-							if (gen === genRef.current) openSocket(gen, t);
-						})
-						.catch(() => {
-							if (gen === genRef.current) {
-								setError("Deepgram reconnect failed");
-								cleanup();
-							}
-						});
-				} else {
-					setError(`Deepgram connection lost (${ev.code})`);
-					cleanup();
-				}
-			});
-		},
-		[cleanup],
-	);
-
 	const start = useCallback(async () => {
 		dictationActiveFlag = true;
 		setError(null);
 		setPhase("connecting");
-		reconnectsRef.current = 0;
 		bufferRef.current = []; // fresh run, fresh buffer (round 2)
-		pendingRef.current = []; // fresh run, fresh queue (mitigation A)
 		const gen = ++genRef.current;
 
 		// Mitigation D: the warm token (pre-minted at mount / after the last
@@ -441,7 +544,16 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		// context, so getUserMedia works without TLS; macOS TCC prompts on
 		// first use.
 		const tokenPromise = warmTokens.mint();
-		tokenPromise.catch(() => {}); // surfaced below; no unhandled rejection
+		tokenPromise.catch(() => {}); // the transport handles failures once capture is ready
+		const connection = createDictationConnection({
+			initialToken: tokenPromise,
+			mintToken: mintFreshToken,
+			onRecording: () => { if (gen === genRef.current) setPhase("recording"); },
+			onTranscript: (text) => { if (gen === genRef.current) bufferRef.current.push(text); },
+			onError: (message) => { if (gen === genRef.current) setError(message); },
+			onEnd: () => { if (gen === genRef.current) cleanup(); },
+		});
+		connectionRef.current = connection;
 		const micPromise = navigator.mediaDevices.getUserMedia({
 			audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
 		});
@@ -464,19 +576,10 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			const worklet = new AudioWorkletNode(ctx, "pcm-capture");
 			workletRef.current = worklet;
 			worklet.port.onmessage = (e) => {
+				if (gen !== genRef.current) return;
 				const msg = e.data as { type: string; rms?: number; buffer?: ArrayBuffer };
-				if (msg.type === "level") {
-					levelRef.current = msg.rms ?? 0; // never reset to zero (dictate pattern)
-				} else if (msg.type === "audio") {
-					const ws = wsRef.current;
-					if (ws && ws.readyState === WebSocket.OPEN) ws.send(msg.buffer!);
-					// Mitigation A: not OPEN yet (handshake or reconnect gap) —
-					// queue, capped; the open handler flushes in order.
-					else {
-						pendingRef.current.push(msg.buffer!);
-						if (pendingRef.current.length > 256) pendingRef.current.shift();
-					}
-				}
+				if (msg.type === "level") levelRef.current = msg.rms ?? 0;
+				else if (msg.type === "audio" && msg.buffer) connection.sendAudio(msg.buffer);
 			};
 			const source = ctx.createMediaStreamSource(stream);
 			sourceRef.current = source;
@@ -497,23 +600,12 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			return;
 		}
 		if (gen !== genRef.current) return;
-		let token: string;
-		try {
-			token = await tokenPromise;
-		} catch (e) {
-			if (gen !== genRef.current) return;
-			setError(e instanceof Error ? e.message : "token unavailable");
-			cleanup();
-			return;
-		}
-		if (gen !== genRef.current) return;
-		// Mitigation B: the handshake fires the moment the graph is live,
-		// overlapping any remaining token wait — mic-gated, never before it.
-		openSocket(gen, token);
-	}, [openSocket, cleanup]);
+		// Capture is live before the handshake. The transport retries temporary
+		// failures without tearing down the microphone or its queued audio.
+		connection.start();
+	}, [cleanup]);
 
 	const stop = useCallback(() => {
-		const gen = genRef.current;
 		if (phase !== "recording" && phase !== "connecting") return;
 		setPhase("stopping");
 
@@ -526,23 +618,8 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		workletRef.current?.disconnect();
 		workletRef.current = null;
 
-		const ws = wsRef.current;
-		if (ws && ws.readyState === WebSocket.OPEN) {
-			try {
-				ws.send(JSON.stringify({ type: "CloseStream" }));
-			} catch {
-				cleanup();
-				return;
-			}
-			// Deepgram flushes remaining finals then closes; if it never
-			// does, the safety net ends the run anyway (dictate pattern).
-			safetyRef.current = setTimeout(() => {
-				if (gen === genRef.current) cleanup();
-			}, 3000);
-		} else {
-			cleanup();
-		}
-	}, [phase, cleanup]);
+		connectionRef.current?.stop();
+	}, [phase]);
 
 	const cancel = useCallback(() => {
 		if (phase === "idle") return;
